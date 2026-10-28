@@ -17,7 +17,7 @@ It is a demo built to behave like production. Prioritize correctness, idempotenc
 | Website + admin | Next.js (App Router, TypeScript strict), Tailwind, shadcn/ui |
 | Hosting | Vercel Hobby |
 | Orchestration | n8n (self-hosted Docker, already running locally) |
-| Tunnel | ngrok static domain: `https://savior-apprehend-appendix.ngrok-free.dev` |
+| Tunnel | ngrok static domain: `https://your-subdomain.ngrok-free.dev` |
 | DB + auth | Supabase (region `ap-northeast-2`), Postgres + Auth + Realtime |
 | AI | Claude Haiku 4.5 (called from n8n only) |
 | Approvals/alerts | Slack free workspace |
