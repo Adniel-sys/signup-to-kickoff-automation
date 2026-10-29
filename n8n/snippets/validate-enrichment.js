@@ -1,14 +1,22 @@
-// n8n Code node: "Validate output" (WF-01, Phase 3).
-// Mode: Run Once for All Items. Language: JavaScript. Paste this whole file.
+// n8n Code nodes: "Validate output" and "Validate output (retry)" (WF-01, Phase 3).
+// Mode: Run Once for All Items. Language: JavaScript. Paste this whole file into both.
 //
-// Input:  the "Call Haiku" HTTP Request output (Anthropic Messages API response),
-//         or { error } when that node failed and "On Error" is set to Continue.
-// Output: { valid: true, data } or { valid: false, errors: [...] }
+// Input:  the "Call Haiku" or "Call Haiku (retry)" HTTP Request output (Anthropic Messages
+//         API response), or { error } when that node failed and "On Error" is set to Continue.
+// Output: { valid: true, data, attempt, step_output }
+//      or { valid: false, errors: [...], attempt, step_output }
+//
+// After validation, business rules are applied in code (see applyBusinessRules), so a hard
+// rule never depends on the model following the prompt.
 //
 // SCHEMA must stay identical to n8n/prompts/intake-enrichment.schema.json
 // (enforced by validate-enrichment.test.mjs). Plain JS only: no imports.
 
 const TOOL_NAME = "record_intake_analysis";
+// Node names this script reads; they must match the canvas exactly.
+const RETRY_CALL_NODE = "Call Haiku (retry)";
+const FIRST_VALIDATE_NODE = "Validate output";
+const WEBHOOK_NODE = "Webhook";
 
 const SCHEMA = {
   type: "object",
@@ -46,13 +54,13 @@ const SCHEMA = {
     risk_level: {
       type: "string",
       enum: ["low", "medium", "high"],
-      description: "Highest rubric level that matches.",
+      description: "high if ANY high-risk condition in the rubric applies, even if the rest looks fine; otherwise medium or low.",
     },
     risk_reason: {
       type: "string",
       minLength: 10,
       maxLength: 300,
-      description: "One sentence: the main reason for risk_level.",
+      description: "One sentence naming the condition behind risk_level (for high: which high-risk condition applies).",
     },
     welcome_email: {
       type: "object",
@@ -175,14 +183,71 @@ function extractToolInput(response) {
   return { input };
 }
 
+/**
+ * Deterministic rules that override the model. Haiku's own verdict is kept in
+ * ai_risk_level, and every rule that changed it is listed in rule_overrides.
+ */
+function applyBusinessRules(data, intake) {
+  const result = { ...data, ai_risk_level: data.risk_level, rule_overrides: [] };
+  // Enterprise engagements always get the full review: never lower than high.
+  if (intake.service_tier === "enterprise" && result.risk_level !== "high") {
+    result.risk_level = "high";
+    result.rule_overrides.push("enterprise_tier_high");
+  }
+  return result;
+}
+
+/** 2 when the input came from the retry call, otherwise 1. */
+function currentAttempt() {
+  return typeof $prevNode !== "undefined" && $prevNode && $prevNode.name === RETRY_CALL_NODE ? 2 : 1;
+}
+
+/** On the retry, the errors that sent us there; kept for the step's output. */
+function firstAttemptErrors() {
+  try {
+    return $(FIRST_VALIDATE_NODE).first().json.errors || [];
+  } catch {
+    return [];
+  }
+}
+
 function validateEnrichment(response) {
+  const attempt = currentAttempt();
+  const history = attempt > 1 ? { first_attempt_errors: firstAttemptErrors() } : {};
+  const fail = (errors) => ({
+    valid: false,
+    errors,
+    attempt,
+    step_output: { errors, ai_attempts: attempt, ...history },
+  });
+
   const extracted = extractToolInput(response);
-  if (extracted.errors) return { valid: false, errors: extracted.errors };
+  if (extracted.errors) return fail(extracted.errors);
 
   const errors = [];
   validate(SCHEMA, extracted.input, "", errors);
-  if (errors.length > 0) return { valid: false, errors };
-  return { valid: true, data: extracted.input };
+  if (errors.length > 0) return fail(errors);
+
+  let intake;
+  try {
+    intake = $(WEBHOOK_NODE).first().json.body || {};
+  } catch {
+    return fail([`Could not read the intake from the ${WEBHOOK_NODE} node`]);
+  }
+  const data = applyBusinessRules(extracted.input, intake);
+  return {
+    valid: true,
+    data,
+    attempt,
+    step_output: {
+      summary: data.summary,
+      risk_level: data.risk_level,
+      ai_risk_level: data.ai_risk_level,
+      rule_overrides: data.rule_overrides,
+      ai_attempts: attempt,
+      ...history,
+    },
+  };
 }
 
 return $input.all().map((item) => ({ json: validateEnrichment(item.json) }));

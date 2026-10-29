@@ -34,13 +34,13 @@
     "risk_level": {
       "type": "string",
       "enum": ["low", "medium", "high"],
-      "description": "Highest rubric level that matches."
+      "description": "high if ANY high-risk condition in the rubric applies, even if the rest looks fine; otherwise medium or low."
     },
     "risk_reason": {
       "type": "string",
       "minLength": 10,
       "maxLength": 300,
-      "description": "One sentence: the main reason for risk_level."
+      "description": "One sentence naming the condition behind risk_level (for high: which high-risk condition applies)."
     },
     "welcome_email": {
       "type": "object",

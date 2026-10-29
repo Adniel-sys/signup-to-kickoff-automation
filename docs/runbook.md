@@ -188,31 +188,36 @@ the output is validated, and the result is saved. The website already has its an
 so Haiku's latency never counts against the website's 10 s timeout.
 
 ```
-New Run Created ─▶ Mark enriching ─▶ Call Haiku ─▶ Validate output ─▶ Output valid? ─ true ─▶ Save enrichment
-                                                                                  └ false ─▶ Mark failed
+New Run Created ─▶ Mark enriching ─▶ Call Haiku ─▶ Validate output ─▶ Output valid? ─ true ──────────────────────────────────────────────────▶ Save enrichment
+                                                                                  └ false ─▶ Call Haiku (retry) ─▶ Validate output (retry) ─▶ Retry valid? ─ true ─▶ Save enrichment
+                                                                                                                                                         └ false ─▶ Mark failed
 ```
+
+Haiku gets one automatic second try when its first output fails validation. Only a second failure
+marks the run failed. The retry is a plain copy of the first chain, so the canvas reads left to
+right with no loop.
 
 Files used here:
 
 | File | What it is |
 |---|---|
-| `n8n/prompts/intake-enrichment.system.md` | Haiku system prompt (rules, risk rubric, email rules) |
-| `n8n/prompts/intake-enrichment.schema.json` | JSON Schema for the tool input; the source of truth for the output shape |
-| `n8n/snippets/build-haiku-request.mjs` | Prints the `Call Haiku` body expression with the prompt and schema inlined |
-| `n8n/snippets/validate-enrichment.js` | The `Validate output` Code node script |
+| `n8n/prompts/intake-enrichment.system.md` | Haiku system prompt (rules, risk rubric, language rule, email rules) |
+| `n8n/prompts/intake-enrichment.schema.json` | JSON Schema for the tool input, with every length and count limit; the source of truth for the output shape |
+| `n8n/snippets/build-haiku-request.mjs` | Prints the `Call Haiku` body expression with the prompt and the strict tool schema inlined |
+| `n8n/snippets/validate-enrichment.js` | The script for both `Validate output` Code nodes: validation plus business rules |
 | `n8n/samples/intake-{low,medium,high}.json` | Test intakes (see Test below) |
 
 Rules carried over from Phase 2: read earlier data with `$('Webhook').first()` /
 `$('Insert client + run').first()` (never `.item`), and switch **every** field that contains `{{ }}`
 to **Expression** mode.
 
-### 0. Credential: `Anthropic API` (one time)
+### 0. Credential: Anthropic (one time)
 
-Credentials → Create → **Header Auth**:
+Credentials → Create → **Anthropic**: paste your Anthropic API key (`sk-ant-…`). Give it any label,
+for example `Anthropic - Signup-to-Kickoff`. n8n sends it as the `x-api-key` header.
 
-- **Credential name:** `Anthropic API` (only a label)
-- **Name:** `x-api-key` (exact, lowercase; this is the header n8n sends)
-- **Value:** your Anthropic API key (`sk-ant-…`)
+A **Header Auth** credential works too: **Name** `x-api-key` (exact, lowercase), **Value** the key.
+In that case, use `Generic Credential Type` → `Header Auth` in step 2 instead.
 
 ### 1. `Mark enriching` (Postgres): connect from `New Run Created`
 
@@ -254,8 +259,10 @@ returning run_id, attempt, created_at as started_at;
 ### 2. `Call Haiku` (HTTP Request)
 
 - **Method:** `POST` · **URL:** `https://api.anthropic.com/v1/messages`
-- **Authentication:** `Generic Credential Type` → **Generic Auth Type:** `Header Auth` → `Anthropic API`
-- **Send Headers:** ON → `anthropic-version` = `2023-06-01` (Fixed mode)
+- **Authentication:** `Predefined Credential Type` → **Credential Type:** `Anthropic` → your credential
+- **Send Headers:** ON → `anthropic-version` = `2023-06-01` (Fixed mode). That is the only header
+  to add. Strict tool use is generally available, so it needs no `anthropic-beta` header.
+  `x-api-key` comes from the credential, and `content-type` from the JSON body.
 - **Send Body:** ON → **Body Content Type:** `JSON` → **Specify Body:** `Using JSON`
 - **JSON:** switch the field to **Expression**, then paste the output of:
 
@@ -264,18 +271,19 @@ node n8n/snippets/build-haiku-request.mjs | clip     # Windows; copies it to the
 ```
 
   The pasted expression has this shape. The generator inlines `system` from the prompt file and
-  `input_schema` from the schema file:
+  `input_schema` from the schema file, minus the keywords strict mode rejects:
 
 ```
 {{ JSON.stringify({
   model: "claude-haiku-4-5",
-  max_tokens: 1500,
+  max_tokens: 2000,
   temperature: 0.2,
   system: "<intake-enrichment.system.md as a JSON string>",
   tools: [{
     name: "record_intake_analysis",
     description: "Record the structured analysis of one Northpeak Studio project intake. Call exactly once.",
-    input_schema: <intake-enrichment.schema.json>
+    strict: true,
+    input_schema: <intake-enrichment.schema.json without minLength, maxLength, maxItems, minItems above 1>
   }],
   tool_choice: { type: "tool", name: "record_intake_analysis" },
   messages: [{
@@ -306,8 +314,13 @@ node n8n/snippets/build-haiku-request.mjs | clip     # Windows; copies it to the
 Why it's built this way:
 - **Forced tool:** `tool_choice` forces a `record_intake_analysis` call, so the answer comes back as
   `content[].input` JSON, not prose.
-- **No `strict`:** `strict: true` is left off on purpose. Strict mode doesn't support the schema's
-  `minLength`/`maxLength`/`minItems`/`maxItems` constraints, and `Validate output` enforces them instead.
+- **Strict tool use:** `strict: true` makes the API constrain Haiku's output to the tool schema. So
+  required fields are always present, `welcome_email` is always an object, and no extra keys like
+  `goal1` appear. Strict mode rejects `minLength`, `maxLength`, `maxItems` and `minItems` above 1
+  with a 400, so the generator drops those from the **tool** schema only. The schema file keeps
+  every limit, and `Validate output` enforces them.
+- **`max_tokens: 2000`:** raised from 1500 to leave room for non-English output, which takes more
+  tokens for the same text.
 - **Intake data:** `contact_email` and `submission_id` are not sent to the model. Any `<` in the
   intake is escaped as `<`, so the intake can't close its `<intake>` tag.
 - **API version:** `temperature: 0.2` is accepted under `anthropic-version: 2023-06-01`. If this
@@ -319,17 +332,49 @@ Why it's built this way:
 - **Mode:** `Run Once for All Items` · **Language:** `JavaScript`
 - **Code:** paste all of `n8n/snippets/validate-enrichment.js`.
 
-It outputs `{ valid: true, data }` or `{ valid: false, errors: [...] }`. A schema violation, a
-missing tool call, `stop_reason` `max_tokens`/`refusal`, and an API error all become `valid: false`
-with readable errors. Its embedded schema is tested against the schema file (`npm run test:n8n`), so
-if you edit the schema, update the snippet too and re-paste it.
+It outputs `{ valid: true, data, attempt, step_output }` or
+`{ valid: false, errors: [...], attempt, step_output }`. A schema violation, a missing tool call,
+`stop_reason` `max_tokens`/`refusal`, and an API error all become `valid: false` with readable
+errors. Its embedded schema is tested against the schema file (`npm run test:n8n`), so if you edit
+the schema, update the snippet too and re-paste it.
+
+After validation passes, the script applies **business rules in code**, so they never depend on the
+prompt being followed:
+
+- `service_tier = enterprise` → `risk_level = high` (never lower).
+- `data.ai_risk_level` always holds Haiku's own verdict. `data.rule_overrides` lists each rule that
+  changed it, for example `["enterprise_tier_high"]`, or is `[]` when none did.
+
+The script finds the tier with `$('Webhook').first()`. It tells the first call from the retry by
+the node its input came from (`$prevNode`), so the node names in steps 4–5 must match exactly.
 
 ### 4. `Output valid?` (IF)
 
 - **Condition:** Boolean → `{{ $json.valid }}` → **is true**
-- `true` → step 5, `false` → step 6.
+- `true` → step 6 (`Save enrichment`), `false` → step 5 (`Call Haiku (retry)`).
 
-### 5. `Save enrichment` (Postgres), on the true branch
+### 5. The retry chain: `Call Haiku (retry)` → `Validate output (retry)` → `Retry valid?`
+
+1. Select `Call Haiku` and `Validate output` on the canvas, then copy and paste them (Ctrl+C,
+   Ctrl+V). The copies keep every setting: body, credential, headers, timeout, Retry On Fail,
+   On Error `Continue`, and the script.
+2. Rename the copies to exactly `Call Haiku (retry)` and `Validate output (retry)`. The script
+   matches the first name to report `attempt: 2`. It reads the first attempt's errors from the node
+   named exactly `Validate output`, so leave the original's name as it is.
+3. Connect `Output valid?` **false** → `Call Haiku (retry)` → `Validate output (retry)`. The pasted
+   copies arrive already connected to each other; check that this link is there.
+4. Add an **IF** after `Validate output (retry)`, named `Retry valid?`, with the same condition:
+   `{{ $json.valid }}` **is true**.
+5. Connect `Retry valid?` **true** → `Save enrichment` (it now has two incoming links) and
+   **false** → `Mark failed`. Delete the old `Output valid?` false → `Mark failed` link.
+
+The retry sends the same request. The body reads the intake from `$('Webhook').first()`, not from
+`$json`, so it doesn't depend on what came before it. Haiku is sampled at `temperature: 0.2`, so a
+second call usually gives different output, and most one-off slips pass on the retry.
+
+### 6. `Save enrichment` (Postgres), from `Output valid?` true and `Retry valid?` true
+
+(Your canvas names this node `Save Enrichment`; the name doesn't matter here.)
 
 - **Credential:** `Supabase - Signup-to-Kickoff` · **Operation:** `Execute Query`
 - **Query:**
@@ -337,6 +382,7 @@ if you edit the schema, update the snippet too and re-paste it.
 ```sql
 -- Store the analysis on the client and close the step, in one statement.
 -- Run status stays 'enriching'; Phase 4 moves it on to approval.
+-- attempt counts Haiku tries: Mark enriching opened it at n, the retry adds 1.
 with saved as (
   update public.clients
      set intake_ai  = $2::jsonb,
@@ -346,12 +392,13 @@ with saved as (
 )
 update public.run_steps
    set status      = 'succeeded',
+       attempt     = attempt + ($5::int - 1),
        duration_ms = (extract(epoch from (now() - created_at)) * 1000)::int,
        output      = $4::jsonb,
        error       = null
  where run_id = $1::uuid
    and step_name = 'enrich_with_ai'
-returning run_id, status, duration_ms;
+returning run_id, status, attempt, duration_ms;
 ```
 
 - **Options → Query Parameters** (Expression):
@@ -361,11 +408,17 @@ returning run_id, status, duration_ms;
   $('Insert client + run').first().json.run_id,
   JSON.stringify($json.data),
   $json.data.risk_level,
-  JSON.stringify({ summary: $json.data.summary, risk_level: $json.data.risk_level })
+  JSON.stringify($json.step_output),
+  $json.attempt
 ] }}
 ```
 
-### 6. `Mark failed` (Postgres), on the false branch
+`$json` is whichever `Validate output` node fed this one. `data` already has the business rules
+applied, so `clients.risk_level` and `intake_ai` store the final level, with `ai_risk_level` and
+`rule_overrides` alongside. `step_output` holds `{ summary, risk_level, ai_risk_level,
+rule_overrides, ai_attempts }`, plus `first_attempt_errors` after a retry.
+
+### 7. `Mark failed` (Postgres), from `Retry valid?` false
 
 - **Credential:** `Supabase - Signup-to-Kickoff` · **Operation:** `Execute Query`
 - **Query:**
@@ -375,6 +428,7 @@ returning run_id, status, duration_ms;
 with step as (
   update public.run_steps
      set status      = 'failed',
+         attempt     = attempt + ($4::int - 1),
          duration_ms = (extract(epoch from (now() - created_at)) * 1000)::int,
          error       = $2,
          output      = $3::jsonb
@@ -396,9 +450,13 @@ returning id as run_id, status;
 {{ [
   $('Insert client + run').first().json.run_id,
   ('enrich_with_ai: ' + $json.errors.join('; ')).slice(0, 1000),
-  JSON.stringify({ errors: $json.errors })
+  JSON.stringify($json.step_output),
+  $json.attempt
 ] }}
 ```
+
+`error` holds the second attempt's errors. `output` holds `{ errors, ai_attempts: 2,
+first_attempt_errors }`, so both attempts can be read later.
 
 Save the workflow. It stays active, so the next production submission runs the new branch.
 
@@ -458,9 +516,52 @@ Haiku isn't deterministic. If `medium` occasionally lands on `low` or `high`, re
 before changing the prompt. Re-run 2–3 times, and only tune the rubric if the miss repeats. The
 `low` and `high` samples should be stable.
 
-**Failure branch:** set `max_tokens` to `50` in the pasted expression, then send one sample. The row
-should show `step_status = failed`, `run_status = failed`, and `error` starting with
-`enrich_with_ai: Response was cut off`. Re-paste the generator output afterwards.
+**Failure branch:** set `max_tokens` to `50` in **both** `Call Haiku` nodes, then send one sample.
+The row should show `step_status = failed`, `attempt = 2`, `run_status = failed`, and `error`
+starting with `enrich_with_ai: Response was cut off`. Re-paste the generator output into both
+afterwards.
+
+**Retry branch:** set `max_tokens` to `50` in `Call Haiku` only, and send one sample. The step
+should succeed with `attempt = 2`, and `output -> 'first_attempt_errors'` should mention
+`Response was cut off`. Re-paste afterwards.
+
+#### Phase 3 fix re-test
+
+Submit each of these through `/onboard`, then run the query below.
+
+| # | Client | Expected | What it checks |
+|---|---|---|---|
+| 1 | Bloom & Basil Florist | `low` | Unchanged behaviour |
+| 2 | Summit Physical Therapy | `medium` | Unchanged behaviour |
+| 3 | Vertex Commerce Group | `high`, `succeeded` | Strict mode: no structure failures on a complex intake |
+| 4 | Test Corp (injection) | `high`, injection flagged, clean email | Injection handling unchanged |
+| 5 | Meridian Health Network (enterprise) | `high` | Enterprise rule. If Haiku said otherwise: `ai_risk_level` ≠ `high` and `rule_overrides = ["enterprise_tier_high"]` |
+| 6 | Sari-Sari Hub PH (Filipino) | `low`, all text in Filipino | Language rule, including `risk_reason` and `risk_flags` |
+| 7 | Bright Ideas Co (vague) | `high`, `risk_reason` names vague scope | Rubric: any high-risk condition means high |
+
+```sql
+select c.company_name,
+       c.service_tier,
+       c.risk_level,
+       c.intake_ai ->> 'ai_risk_level'  as ai_risk_level,
+       c.intake_ai -> 'rule_overrides'  as rule_overrides,
+       r.status                         as run_status,
+       s.status                         as step_status,
+       s.attempt,
+       s.output -> 'first_attempt_errors' as first_attempt_errors,
+       c.intake_ai ->> 'risk_reason'    as risk_reason,
+       s.error
+from public.clients c
+join public.onboarding_runs r on r.client_id = c.id
+left join public.run_steps s on s.run_id = r.id and s.step_name = 'enrich_with_ai'
+order by r.started_at desc
+limit 7;
+```
+
+Every row should have `step_status = succeeded`. `attempt = 2` is acceptable (the retry did its
+job), but if the same client keeps needing it, look at `first_attempt_errors`. For #6, also read
+the email and agenda:
+`select intake_ai from public.clients where company_name = 'Sari-Sari Hub PH' order by created_at desc limit 1;`
 
 Clean up test rows (this cascades to the runs and steps):
 `delete from public.clients where company_name in ('Harbor & Pine Dental', 'Fernway Coffee Roasters', 'NextGen Holdings');`
@@ -471,12 +572,17 @@ Clean up test rows (this cascades to the runs and steps):
 |---|---|
 | Run stays `received`, with no `run_steps` row | `Mark enriching` isn't connected after `New Run Created`, or the workflow wasn't saved |
 | `Mark enriching` returns 0 rows | Expected for a run that isn't `received` or a step that already succeeded. Otherwise check that the parameter reads `$('Insert client + run').first()` |
-| Step `failed`, error `Anthropic API call failed: … 401` | `Anthropic API` credential: Name isn't exactly `x-api-key`, or the key is wrong or revoked |
+| Step `failed`, error `Anthropic API call failed: … 401` | The Anthropic credential's key is wrong or revoked (with Header Auth: Name isn't exactly `x-api-key`) |
+| Error `… 400` mentioning the schema, `minLength`, `maxItems` or `minItems` | The tool schema still has a keyword strict mode rejects. Re-paste the generator output; don't paste the schema file by hand |
+| Error `… 400 Schema is too complex for compilation` | The schema grew past strict mode's limits. Simplify it, or set `strict` back to `false` temporarily |
+| A retried step shows `attempt` 1, or no `first_attempt_errors` | The copied nodes aren't named exactly `Call Haiku (retry)` / `Validate output`. Rename them |
+| Error `Could not read the intake from the Webhook node` | The trigger node was renamed. It must be called `Webhook` |
+| Enterprise run saved below `high` | `Validate output` has the old script. Re-paste `validate-enrichment.js` into **both** Code nodes |
 | Error `… 400` mentioning `temperature` | The call was moved to `anthropic-version: 2026-10-21`; set it back to `2023-06-01` or remove `temperature` |
 | Error `… 400` invalid request / JSON | The body field is in Fixed mode, or a hand-edited expression broke. Re-paste the generator output in Expression mode |
 | Error `… 429` or `… 529 overloaded` after 2 tries | Rate-limited or overloaded. Both are temporary; re-send the intake (a fresh `submission_id`), or raise Max Tries |
-| Error `… timeout` | Haiku took longer than 30 s. Rare at 1500 tokens; check Anthropic status |
-| Error `Response was cut off (stop_reason=max_tokens)` | `max_tokens` too low for the output; keep it at 1500 |
+| Error `… timeout` | Haiku took longer than 30 s. Rare at 2000 tokens; check Anthropic status |
+| Error `Response was cut off (stop_reason=max_tokens)` | `max_tokens` too low for the output; keep it at 2000 in both `Call Haiku` nodes |
 | Error `No record_intake_analysis tool call` | `tool_choice` missing or the tool name was changed; re-paste the generator output |
 | Errors like `welcome_email.body: must be at least 400 characters` | Haiku broke a schema rule. One-off: re-send. Repeated: tighten the prompt for that field |
 | `Validate output` fails with `$input is not defined` / `SyntaxError` | Code node isn't in "Run Once for All Items" JavaScript mode, or the paste was partial |
