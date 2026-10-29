@@ -8,6 +8,8 @@ const eslintConfig = defineConfig([
   {
     rules: {
       "@typescript-eslint/no-explicit-any": "error",
+      // Allow `const { omitted, ...rest } = obj` to drop a key.
+      "@typescript-eslint/no-unused-vars": ["warn", { ignoreRestSiblings: true }],
     },
   },
   // Override default ignores of eslint-config-next.

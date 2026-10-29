@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   check:
-    name: Lint and type-check
+    name: Lint, type-check, and test
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -27,3 +27,5 @@ jobs:
       - run: npm run lint
 
       - run: npm run typecheck
+
+      - run: npm test
