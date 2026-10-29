@@ -180,3 +180,305 @@ Clean up test rows afterwards: `delete from public.clients where submission_id =
 | 502, log shows `HTTP 200` with some other body | A reply node's body or status is wrong, or "Always Output Data" is off on `Insert client + run` |
 | Duplicate submit fails in n8n with "Paired item data … unavailable" | `Find existing run` uses `$('Webhook').item`; change it to `$('Webhook').first()` |
 | Replaying a request in the console returns 403 | Expected with real Turnstile keys: tokens are single-use. Use the test keys or the curl check. |
+
+## WF-01 continued: Phase 3 enrichment
+
+After `New Run Created` replies 202, the same execution carries on. Haiku 4.5 analyzes the intake,
+the output is validated, and the result is saved. The website already has its answer at this point,
+so Haiku's latency never counts against the website's 10 s timeout.
+
+```
+New Run Created ─▶ Mark enriching ─▶ Call Haiku ─▶ Validate output ─▶ Output valid? ─ true ─▶ Save enrichment
+                                                                                  └ false ─▶ Mark failed
+```
+
+Files used here:
+
+| File | What it is |
+|---|---|
+| `n8n/prompts/intake-enrichment.system.md` | Haiku system prompt (rules, risk rubric, email rules) |
+| `n8n/prompts/intake-enrichment.schema.json` | JSON Schema for the tool input; the source of truth for the output shape |
+| `n8n/snippets/build-haiku-request.mjs` | Prints the `Call Haiku` body expression with the prompt and schema inlined |
+| `n8n/snippets/validate-enrichment.js` | The `Validate output` Code node script |
+| `n8n/samples/intake-{low,medium,high}.json` | Test intakes (see Test below) |
+
+Rules carried over from Phase 2: read earlier data with `$('Webhook').first()` /
+`$('Insert client + run').first()` (never `.item`), and switch **every** field that contains `{{ }}`
+to **Expression** mode.
+
+### 0. Credential: `Anthropic API` (one time)
+
+Credentials → Create → **Header Auth**:
+
+- **Credential name:** `Anthropic API` (only a label)
+- **Name:** `x-api-key` (exact, lowercase; this is the header n8n sends)
+- **Value:** your Anthropic API key (`sk-ant-…`)
+
+### 1. `Mark enriching` (Postgres): connect from `New Run Created`
+
+- **Credential:** `Supabase - Signup-to-Kickoff` · **Operation:** `Execute Query`
+- **Query:**
+
+```sql
+-- Move the run to 'enriching' and open the enrich_with_ai step, in one statement.
+-- Only a 'received' run can start; a step that already succeeded is never reopened.
+with run as (
+  update public.onboarding_runs
+     set status = 'enriching'
+   where id = $1::uuid
+     and status = 'received'
+     and not exists (
+       select 1 from public.run_steps
+        where run_id = $1::uuid and step_name = 'enrich_with_ai' and status = 'succeeded'
+     )
+  returning id
+)
+insert into public.run_steps (run_id, step_name, status, attempt)
+select id, 'enrich_with_ai', 'started', 1
+from run
+on conflict (run_id, step_name) do update
+   set status      = 'started',
+       attempt     = public.run_steps.attempt + 1,
+       error       = null,
+       output      = null,
+       duration_ms = null,
+       created_at  = now()
+ where public.run_steps.status <> 'succeeded'
+returning run_id, attempt, created_at as started_at;
+```
+
+- **Options → Query Parameters** (Expression): `{{ [ $('Insert client + run').first().json.run_id ] }}`
+- Leave **Always Output Data OFF**. Zero rows means the run wasn't `received` or the step already
+  succeeded, and the branch should stop there, before spending a Haiku call.
+
+### 2. `Call Haiku` (HTTP Request)
+
+- **Method:** `POST` · **URL:** `https://api.anthropic.com/v1/messages`
+- **Authentication:** `Generic Credential Type` → **Generic Auth Type:** `Header Auth` → `Anthropic API`
+- **Send Headers:** ON → `anthropic-version` = `2023-06-01` (Fixed mode)
+- **Send Body:** ON → **Body Content Type:** `JSON` → **Specify Body:** `Using JSON`
+- **JSON:** switch the field to **Expression**, then paste the output of:
+
+```bash
+node n8n/snippets/build-haiku-request.mjs | clip     # Windows; copies it to the clipboard
+```
+
+  The pasted expression has this shape. The generator inlines `system` from the prompt file and
+  `input_schema` from the schema file:
+
+```
+{{ JSON.stringify({
+  model: "claude-haiku-4-5",
+  max_tokens: 1500,
+  temperature: 0.2,
+  system: "<intake-enrichment.system.md as a JSON string>",
+  tools: [{
+    name: "record_intake_analysis",
+    description: "Record the structured analysis of one Northpeak Studio project intake. Call exactly once.",
+    input_schema: <intake-enrichment.schema.json>
+  }],
+  tool_choice: { type: "tool", name: "record_intake_analysis" },
+  messages: [{
+    role: "user",
+    content: "<intake>\n" + JSON.stringify({
+    company_name: $('Webhook').first().json.body.company_name,
+    contact_name: $('Webhook').first().json.body.contact_name,
+    service_tier: $('Webhook').first().json.body.service_tier,
+    website: $('Webhook').first().json.body.website ?? null,
+    project_description: $('Webhook').first().json.body.project_description,
+    budget_range: $('Webhook').first().json.body.budget_range,
+    timeline: $('Webhook').first().json.body.timeline,
+    }, null, 2).replace(/</g, "\\u003c") + "\n</intake>"
+  }]
+}) }}
+```
+
+  Don't assemble this by hand. The generator escapes the prompt correctly and lays the schema out
+  so that no `}}` appears inside the expression, which n8n would read as the end of it. Re-run it
+  and re-paste whenever the prompt or schema changes.
+
+- **Options → Timeout:** `30000`
+- **Settings tab:** **Retry On Fail** ON, **Max Tries** `2`, **Wait Between Tries (ms)** `2000`.
+  **On Error:** `Continue` (the plain option, not "using error output"). A call that still fails
+  then reaches `Validate output` as an `{ error }` item and is recorded as a failed step, so the run
+  is never left stuck in `enriching`.
+
+Why it's built this way:
+- **Forced tool:** `tool_choice` forces a `record_intake_analysis` call, so the answer comes back as
+  `content[].input` JSON, not prose.
+- **No `strict`:** `strict: true` is left off on purpose. Strict mode doesn't support the schema's
+  `minLength`/`maxLength`/`minItems`/`maxItems` constraints, and `Validate output` enforces them instead.
+- **Intake data:** `contact_email` and `submission_id` are not sent to the model. Any `<` in the
+  intake is escaped as `<`, so the intake can't close its `<intake>` tag.
+- **API version:** `temperature: 0.2` is accepted under `anthropic-version: 2023-06-01`. If this
+  call is ever moved to `anthropic-version: 2026-10-21`, remove `temperature`, because that version
+  rejects it with a 400.
+
+### 3. `Validate output` (Code)
+
+- **Mode:** `Run Once for All Items` · **Language:** `JavaScript`
+- **Code:** paste all of `n8n/snippets/validate-enrichment.js`.
+
+It outputs `{ valid: true, data }` or `{ valid: false, errors: [...] }`. A schema violation, a
+missing tool call, `stop_reason` `max_tokens`/`refusal`, and an API error all become `valid: false`
+with readable errors. Its embedded schema is tested against the schema file (`npm run test:n8n`), so
+if you edit the schema, update the snippet too and re-paste it.
+
+### 4. `Output valid?` (IF)
+
+- **Condition:** Boolean → `{{ $json.valid }}` → **is true**
+- `true` → step 5, `false` → step 6.
+
+### 5. `Save enrichment` (Postgres), on the true branch
+
+- **Credential:** `Supabase - Signup-to-Kickoff` · **Operation:** `Execute Query`
+- **Query:**
+
+```sql
+-- Store the analysis on the client and close the step, in one statement.
+-- Run status stays 'enriching'; Phase 4 moves it on to approval.
+with saved as (
+  update public.clients
+     set intake_ai  = $2::jsonb,
+         risk_level = $3
+   where id = (select client_id from public.onboarding_runs where id = $1::uuid)
+  returning id
+)
+update public.run_steps
+   set status      = 'succeeded',
+       duration_ms = (extract(epoch from (now() - created_at)) * 1000)::int,
+       output      = $4::jsonb,
+       error       = null
+ where run_id = $1::uuid
+   and step_name = 'enrich_with_ai'
+returning run_id, status, duration_ms;
+```
+
+- **Options → Query Parameters** (Expression):
+
+```
+{{ [
+  $('Insert client + run').first().json.run_id,
+  JSON.stringify($json.data),
+  $json.data.risk_level,
+  JSON.stringify({ summary: $json.data.summary, risk_level: $json.data.risk_level })
+] }}
+```
+
+### 6. `Mark failed` (Postgres), on the false branch
+
+- **Credential:** `Supabase - Signup-to-Kickoff` · **Operation:** `Execute Query`
+- **Query:**
+
+```sql
+-- Fail the step and the run together, with the validation errors on both.
+with step as (
+  update public.run_steps
+     set status      = 'failed',
+         duration_ms = (extract(epoch from (now() - created_at)) * 1000)::int,
+         error       = $2,
+         output      = $3::jsonb
+   where run_id = $1::uuid
+     and step_name = 'enrich_with_ai'
+  returning run_id
+)
+update public.onboarding_runs
+   set status      = 'failed',
+       error       = $2,
+       finished_at = now()
+ where id = $1::uuid
+returning id as run_id, status;
+```
+
+- **Options → Query Parameters** (Expression):
+
+```
+{{ [
+  $('Insert client + run').first().json.run_id,
+  ('enrich_with_ai: ' + $json.errors.join('; ')).slice(0, 1000),
+  JSON.stringify({ errors: $json.errors })
+] }}
+```
+
+Save the workflow. It stays active, so the next production submission runs the new branch.
+
+### Test
+
+Send the three sample intakes from PowerShell 7, each with a fresh `submission_id`. Fill in your
+secret and ngrok domain, and run from the repo root:
+
+```powershell
+$secret  = "<ONBOARD_WEBHOOK_SECRET>"
+$url     = "https://<your-subdomain>.ngrok-free.dev/webhook/onboard"
+$headers = @{ "X-Onboard-Secret" = $secret; "ngrok-skip-browser-warning" = "true" }
+foreach ($name in "low", "medium", "high") {
+  $intake = Get-Content "n8n/samples/intake-$name.json" -Raw | ConvertFrom-Json
+  $intake.submission_id = [guid]::NewGuid().ToString()
+  $r = Invoke-WebRequest -Method Post -Uri $url -Headers $headers -ContentType "application/json" `
+         -Body ($intake | ConvertTo-Json) -SkipHttpErrorCheck
+  "$name -> HTTP $($r.StatusCode) $($r.Content)"
+}
+```
+
+Each call should return `202` straight away. Give Haiku a few seconds, then check in the Supabase SQL editor:
+
+```sql
+select c.company_name,
+       c.risk_level,
+       r.status                       as run_status,
+       s.status                       as step_status,
+       s.duration_ms,
+       c.intake_ai ->> 'risk_reason'  as risk_reason,
+       c.intake_ai -> 'risk_flags'    as risk_flags,
+       s.error
+from public.clients c
+join public.onboarding_runs r on r.client_id = c.id
+left join public.run_steps s on s.run_id = r.id and s.step_name = 'enrich_with_ai'
+order by r.started_at desc
+limit 3;
+```
+
+| Sample | What it tests | Expected `risk_level` |
+|---|---|---|
+| `intake-low.json`: Harbor & Pine Dental | Clear 8-page redesign + booking + local SEO, growth tier, $15k–50k, 3–6 months | `low` |
+| `intake-medium.json`: Fernway Coffee Roasters | Simple site is clear, but "sell beans online at some point, maybe a subscription, not sure" is an open gap | `medium` |
+| `intake-high.json`: NextGen Holdings | Enterprise tier, "Uber + Airbnb" web + mobile with AI and crypto, under $5k, asap, **plus a prompt-injection attempt** | `high` |
+
+For every row, `run_status` should be `enriching`, `step_status` `succeeded`, and `duration_ms` filled
+in. Also read the high-risk email: it must **not** contain "$3,000", any price, or a date, and
+`risk_flags` should include the injection flag:
+
+```sql
+select c.intake_ai -> 'welcome_email' ->> 'body' as email
+from public.clients c where c.company_name = 'NextGen Holdings'
+order by c.created_at desc limit 1;
+```
+
+Haiku isn't deterministic. If `medium` occasionally lands on `low` or `high`, read `risk_reason`
+before changing the prompt. Re-run 2–3 times, and only tune the rubric if the miss repeats. The
+`low` and `high` samples should be stable.
+
+**Failure branch:** set `max_tokens` to `50` in the pasted expression, then send one sample. The row
+should show `step_status = failed`, `run_status = failed`, and `error` starting with
+`enrich_with_ai: Response was cut off`. Re-paste the generator output afterwards.
+
+Clean up test rows (this cascades to the runs and steps):
+`delete from public.clients where company_name in ('Harbor & Pine Dental', 'Fernway Coffee Roasters', 'NextGen Holdings');`
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| Run stays `received`, with no `run_steps` row | `Mark enriching` isn't connected after `New Run Created`, or the workflow wasn't saved |
+| `Mark enriching` returns 0 rows | Expected for a run that isn't `received` or a step that already succeeded. Otherwise check that the parameter reads `$('Insert client + run').first()` |
+| Step `failed`, error `Anthropic API call failed: … 401` | `Anthropic API` credential: Name isn't exactly `x-api-key`, or the key is wrong or revoked |
+| Error `… 400` mentioning `temperature` | The call was moved to `anthropic-version: 2026-10-21`; set it back to `2023-06-01` or remove `temperature` |
+| Error `… 400` invalid request / JSON | The body field is in Fixed mode, or a hand-edited expression broke. Re-paste the generator output in Expression mode |
+| Error `… 429` or `… 529 overloaded` after 2 tries | Rate-limited or overloaded. Both are temporary; re-send the intake (a fresh `submission_id`), or raise Max Tries |
+| Error `… timeout` | Haiku took longer than 30 s. Rare at 1500 tokens; check Anthropic status |
+| Error `Response was cut off (stop_reason=max_tokens)` | `max_tokens` too low for the output; keep it at 1500 |
+| Error `No record_intake_analysis tool call` | `tool_choice` missing or the tool name was changed; re-paste the generator output |
+| Errors like `welcome_email.body: must be at least 400 characters` | Haiku broke a schema rule. One-off: re-send. Repeated: tighten the prompt for that field |
+| `Validate output` fails with `$input is not defined` / `SyntaxError` | Code node isn't in "Run Once for All Items" JavaScript mode, or the paste was partial |
+| `Save enrichment` errors `invalid input syntax for type json` | A Query Parameters field is in Fixed mode, so the `{{ }}` text was sent literally |
+| Duplicate submit triggers Haiku | `Mark enriching` was connected after the duplicate reply instead of `New Run Created` |

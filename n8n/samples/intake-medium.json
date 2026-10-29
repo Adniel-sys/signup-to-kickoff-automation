@@ -1,0 +1,10 @@
+{
+  "submission_id": "00000000-0000-4000-8000-000000000002",
+  "company_name": "Fernway Coffee Roasters",
+  "contact_name": "Daniel Brooks",
+  "contact_email": "dan@fernway.example",
+  "service_tier": "starter",
+  "project_description": "Small roastery, no website yet. We need a simple site with our story, a menu, and our cafe hours. We would also like to start selling beans online at some point, maybe a subscription, but we are not sure what that involves yet.",
+  "budget_range": "5k_15k",
+  "timeline": "1_3_months"
+}

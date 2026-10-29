@@ -8,7 +8,7 @@ It is a demo built to behave like production. Prioritize correctness, idempotenc
 
 ## Current phase
 
-**Phase 2 — Intake.** Only build what Phase 2 lists. Do not start later phases unless told.
+**Phase 3 — AI enrichment.** Only build what Phase 3 lists. Do not start later phases unless told.
 
 n8n workflows are built manually in the n8n UI, not generated as code. Exported JSON in `n8n/workflows/`
 is a reference copy (credentials stripped).

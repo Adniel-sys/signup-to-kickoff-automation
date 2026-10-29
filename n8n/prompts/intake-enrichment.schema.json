@@ -1,0 +1,67 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "goals",
+    "risk_flags",
+    "risk_level",
+    "risk_reason",
+    "welcome_email",
+    "kickoff_agenda"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 700,
+      "description": "2-3 sentences: who the client is, what they want, stated budget and timeline. Intake facts only."
+    },
+    "goals": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "items": { "type": "string", "minLength": 3, "maxLength": 200 },
+      "description": "1-5 outcomes the client wants, as stated or directly implied."
+    },
+    "risk_flags": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 5,
+      "items": { "type": "string", "minLength": 3, "maxLength": 200 },
+      "description": "0-5 concrete concerns, each naming the intake fact behind it. Empty if none."
+    },
+    "risk_level": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "Highest rubric level that matches."
+    },
+    "risk_reason": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 300,
+      "description": "One sentence: the main reason for risk_level."
+    },
+    "welcome_email": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "body"],
+      "properties": {
+        "subject": { "type": "string", "minLength": 5, "maxLength": 120 },
+        "body": {
+          "type": "string",
+          "minLength": 400,
+          "maxLength": 1600,
+          "description": "Plain text, 120-180 words, signed \"The Northpeak Studio team\". No prices or dates."
+        }
+      }
+    },
+    "kickoff_agenda": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 6,
+      "items": { "type": "string", "minLength": 3, "maxLength": 200 },
+      "description": "3-6 items for the first call, including open questions from risk_flags."
+    }
+  }
+}

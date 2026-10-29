@@ -12,6 +12,7 @@
     "build": "npm run build --workspace=web",
     "lint": "npm run lint --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present"
+    "test": "npm run test --workspaces --if-present && npm run test:n8n",
+    "test:n8n": "node --test n8n/snippets/validate-enrichment.test.mjs"
   }
 }
