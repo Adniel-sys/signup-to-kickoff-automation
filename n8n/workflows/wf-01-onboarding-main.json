@@ -1,0 +1,212 @@
+{
+  "name": "WF-01 Onboarding Main",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "onboard",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "188f2696-62c8-4787-a0bf-d7b823676c9b",
+      "name": "Webhook",
+      "webhookId": "a4e457ce-5f4e-4462-b2aa-03ebaa4e5fb4",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Onboard Webhook Secret"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "with new_client as (\n  insert into public.clients\n    (submission_id, company_name, contact_name, contact_email, service_tier, intake_raw)\n  values\n    ($1::uuid, $2, $3, $4, $5, $6::jsonb)\n  on conflict (submission_id) do nothing\n  returning id\n),\nnew_run as (\n  insert into public.onboarding_runs (client_id, status, n8n_execution_id)\n  select id, 'received', $7\n  from new_client\n  returning id\n)\nselect id as run_id from new_run;",
+        "options": {
+          "queryReplacement": "={{ [   $json.body.submission_id,   $json.body.company_name,   $json.body.contact_name,   $json.body.contact_email,   $json.body.service_tier,   JSON.stringify($json.body),   $execution.id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        208,
+        0
+      ],
+      "id": "737f6ccc-e2b0-4a51-8ef1-d5f926e18c97",
+      "name": "Insert client + run",
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Supabase - Signup-to-Kickoff"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "c17c8f1d-b02c-46ca-ba32-8294fb278bc5",
+              "leftValue": "={{ $json.run_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        416,
+        0
+      ],
+      "id": "9d71b708-d657-48a4-8b0f-5e8678d17b6a",
+      "name": "New run?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, duplicate: false, run_id: $json.run_id } }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        832,
+        -96
+      ],
+      "id": "c2eb6143-04e4-47d5-b237-a1a14fedb319",
+      "name": "New Run Created"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select r.id as run_id\nfrom public.onboarding_runs r\njoin public.clients c on c.id = r.client_id\nwhere c.submission_id = $1::uuid\norder by r.started_at\nlimit 1;",
+        "options": {
+          "queryReplacement": "={{ [ $('Webhook').first().json.body.submission_id ] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        624,
+        96
+      ],
+      "id": "1a2355d5-7443-4261-9308-c475d72e9abf",
+      "name": "Find existing run",
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Supabase - Signup-to-Kickoff"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"ok\": true,\n  \"duplicate\": true,\n  \"run_id\": \"{{ $json.run_id }}\"\n}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        880,
+        112
+      ],
+      "id": "fb2b192d-8d73-417c-9782-0b15ff009841",
+      "name": "Reply: Duplicate, Existing Run"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Insert client + run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert client + run": {
+      "main": [
+        [
+          {
+            "node": "New run?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New run?": {
+      "main": [
+        [
+          {
+            "node": "New Run Created",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Find existing run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find existing run": {
+      "main": [
+        [
+          {
+            "node": "Reply: Duplicate, Existing Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "578b9dfe-a226-4da6-9903-3d90711d51ff",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "nodeGroups": [],
+  "id": "cEK8z7c0v4MLw1Li",
+  "tags": []
+}
