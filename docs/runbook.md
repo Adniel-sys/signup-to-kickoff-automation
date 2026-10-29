@@ -6,8 +6,8 @@ WF-01 is built by hand in the n8n UI. The request and response it has to honour 
 [`api-contract.md`](api-contract.md).
 
 ```
-Webhook ─▶ Insert client + run ─▶ New run? ─ true ─▶ Respond 202 accepted
-                                           └ false ─▶ Find existing run ─▶ Respond 200 duplicate
+Webhook ─▶ Insert client + run ─▶ New run? ─ true ─▶ New Run Created (202)
+                                           └ false ─▶ Find existing run ─▶ Reply: Duplicate, Existing Run (200)
 ```
 
 Use the **exact node names** below, because later expressions refer to nodes by name.
@@ -18,6 +18,11 @@ Use the **exact node names** below, because later expressions refer to nodes by 
 |---|---|---|
 | `Onboard Webhook Secret` | Header Auth | **Name:** `X-Onboard-Secret` · **Value:** the same `ONBOARD_WEBHOOK_SECRET` as in `apps/web/.env.local` |
 | `Supabase - Signup-to-Kickoff` | Postgres | Already set up: Supabase **session pooler** host/port/user, SSL on. Do not use the direct (IPv6-only) host. |
+
+> **Header Auth gotcha:** n8n compares the credential's inner **Name** field against the request
+> header, so it must be exactly `X-Onboard-Secret`. The credential's label (`Onboard Webhook Secret`
+> above) is only a display name and can be anything. If Name is wrong, every call gets 401/403
+> even when the secret value is right.
 
 ### 1. `Webhook`
 
@@ -86,10 +91,13 @@ select id as run_id from new_run;
 On a duplicate, "Always Output Data" emits one empty item, so `run_id` is empty and the `false`
 branch runs.
 
-### 4. `Respond 202 accepted` (Respond to Webhook), on the true branch
+### 4. `New Run Created` (Respond to Webhook), on the true branch
 
 - **Respond With:** `JSON`
-- **Response Body:** `{{ { ok: true, duplicate: false, run_id: $json.run_id } }}`
+- **Response Body:** switch the field to **Expression** (not Fixed), then enter:
+  `{{ { ok: true, duplicate: false, run_id: $json.run_id } }}`
+  In Fixed mode n8n sends the text literally, so `run_id` is never filled in and the website
+  returns 502.
 - **Options → Response Code:** `202`
 
 ### 5. `Find existing run` (Postgres), on the false branch
@@ -107,15 +115,19 @@ limit 1;
 ```
 
 - **Options → Query Parameters** (Expression):
-  `{{ [ $('Webhook').item.json.body.submission_id ] }}`
-  Read it from `Webhook`, because the incoming item here is the empty one.
+  `{{ [ $('Webhook').first().json.body.submission_id ] }}`
+  Read it from `Webhook`, because the incoming item here is the empty one. Use `.first()`, **not**
+  `.item`: the empty item that "Always Output Data" creates has no paired-item link back to the
+  Webhook, so `.item` fails ("Paired item data … unavailable"). The webhook only ever carries one
+  item, so `.first()` is always the right one.
 - Leave **Always Output Data OFF**. If no row is found (which shouldn't happen), the workflow ends
   without a valid response, and the website returns `502` instead of a fake success.
 
-### 6. `Respond 200 duplicate` (Respond to Webhook)
+### 6. `Reply: Duplicate, Existing Run` (Respond to Webhook)
 
 - **Respond With:** `JSON`
-- **Response Body:** `{{ { ok: true, duplicate: true, run_id: $json.run_id } }}`
+- **Response Body:** **Expression** mode (not Fixed), as in step 4:
+  `{{ { ok: true, duplicate: true, run_id: $json.run_id } }}`
 - **Options → Response Code:** `200`
 
 ### Why this is safe under concurrency
@@ -162,7 +174,9 @@ Clean up test rows afterwards: `delete from public.clients where submission_id =
 | Symptom on the website | Likely cause |
 |---|---|
 | "temporarily unavailable" (503) | ngrok not running, or n8n down; the server log shows `ngrok ERR_NGROK_…` or `timed out` |
-| "Something went wrong" (502), log shows `HTTP 401`/`403` | Header Auth value ≠ `ONBOARD_WEBHOOK_SECRET` |
+| "Something went wrong" (502), log shows `HTTP 401`/`403` | Header Auth credential's inner **Name** isn't exactly `X-Onboard-Secret`, or its Value ≠ `ONBOARD_WEBHOOK_SECRET` |
 | 502, log shows `HTTP 404` | Workflow not active, or path isn't `onboard` |
-| 502, log shows `HTTP 200` with some other body | A Respond node's body or status is wrong, or "Always Output Data" is off on `Insert client + run` |
+| 502, log shows a body with a literal `{{ … }}` or no `run_id` | A reply node's Response Body is in Fixed mode; switch it to Expression |
+| 502, log shows `HTTP 200` with some other body | A reply node's body or status is wrong, or "Always Output Data" is off on `Insert client + run` |
+| Duplicate submit fails in n8n with "Paired item data … unavailable" | `Find existing run` uses `$('Webhook').item`; change it to `$('Webhook').first()` |
 | Replaying a request in the console returns 403 | Expected with real Turnstile keys: tokens are single-use. Use the test keys or the curl check. |
