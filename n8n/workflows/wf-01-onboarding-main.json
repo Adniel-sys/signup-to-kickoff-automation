@@ -387,6 +387,49 @@
       ],
       "id": "cb72125b-bb3c-4ee7-9227-a03432a3056d",
       "name": "Retry valid?"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "8QQUxAZd4L0Uorrw",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/8QQUxAZd4L0Uorrw",
+          "cachedResultName": "WF-02 Approval Gate"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "run_id": "={{ $('Insert client + run').first().json.run_id }}"
+          },
+          "matchingColumns": [
+            "run_id"
+          ],
+          "schema": [
+            {
+              "id": "run_id",
+              "displayName": "run_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "canBeUsedToMatch": true,
+              "type": "string",
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        2624,
+        -448
+      ],
+      "id": "96c893ea-874e-4dbb-be6a-6e46be79f373",
+      "name": "Call 'WF-02 Approval Gate'"
     }
   ],
   "pinData": {},
@@ -543,6 +586,17 @@
           }
         ]
       ]
+    },
+    "Save Enrichment": {
+      "main": [
+        [
+          {
+            "node": "Call 'WF-02 Approval Gate'",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "active": true,
@@ -551,7 +605,7 @@
     "binaryMode": "separate",
     "availableInMCP": false
   },
-  "versionId": "19369488-5902-4444-b33a-cf5b5c3c8a92",
+  "versionId": "a26e1aab-607e-4858-b154-1287548a5c91",
   "meta": {
     "templateCredsSetupCompleted": true
   },

@@ -8,7 +8,7 @@ It is a demo built to behave like production. Prioritize correctness, idempotenc
 
 ## Current phase
 
-**Phase 3 — AI enrichment.** Only build what Phase 3 lists. Do not start later phases unless told.
+**Phase 4 complete; next is Phase 5 (WF-03 Provisioning).** Do not start a phase unless told.
 
 n8n workflows are built manually in the n8n UI, not generated as code. Exported JSON in `n8n/workflows/`
 is a reference copy (credentials stripped).
@@ -36,6 +36,32 @@ is a reference copy (credentials stripped).
 - **n8n is the only writer** to Supabase (service role key). The website reads with the anon key + admin auth.
 - `SUPABASE_SERVICE_ROLE_KEY` must never be imported in any client component or shipped to the browser.
 
+### Workflows: the database holds the state
+
+**The database holds the state; workflows are short, stateless event handlers.**
+
+- No Wait node anywhere. Events that happen later (a decision, a timeout) get their own trigger.
+  Reusable work that runs immediately is a sub-workflow (Execute Workflow node).
+- `onboarding_runs.resume_url` stays in the schema but is unused (always NULL).
+- WF-01 is complete (Phases 2–3). Its only Phase 4 addition is the final `Start approval` node
+  (Execute Workflow → WF-02, passes `run_id`, Wait for completion OFF).
+- All approval logic lives in **WF-02 Approval Gate**, which has three entry points:
+  1. *When Executed by Another Workflow* (`run_id`, from WF-01): route the run. Auto-approve only
+     when `risk_level = 'low'` AND `service_tier <> 'enterprise'`; otherwise mark it
+     `awaiting_approval` and send a Slack alert.
+  2. *Webhook* `POST /webhook/approval` (from `/api/approve`): record approve/reject atomically,
+     only while the run is `awaiting_approval`, reply, then post a Slack decision alert.
+  3. *Schedule*, every 15 minutes: reject runs waiting more than 48 hours ("approval timed out").
+- Approvals happen in `/admin`. Slack only sends alerts with a "Review" link; no interactive buttons.
+- The website never writes to the database; n8n does.
+
+| Workflow | Trigger | Status |
+|---|---|---|
+| WF-01 Intake & Enrichment | Webhook `/webhook/onboard` | Done (Phases 2–4; ends with `Start approval`) |
+| WF-02 Approval Gate | 3 triggers (above) | Done (Phase 4) |
+| WF-03 Provisioning | Sub-workflow, called by WF-02 on approval | Phase 5 |
+| WF-04 Error Handler | Error Trigger | Phase 6 |
+
 ## Repo structure
 
 ```
@@ -43,7 +69,7 @@ apps/web/                 Next.js site + /admin dashboard
   app/onboard/            intake form (Phase 2)
   app/admin/              runs, run detail, approvals (Phase 4/6)
   app/api/onboard/        forwards to n8n (Phase 2)
-  app/api/approve/        dashboard + Slack approvals (Phase 4)
+  app/api/approve/        dashboard approvals → n8n WF-02 (Phase 4)
   lib/                    supabase clients, zod schemas, env validation
   tests/                  Vitest + Playwright
 n8n/workflows/            exported workflow JSON (credentials stripped)
@@ -153,9 +179,11 @@ Validate env at startup with Zod in `apps/web/lib/env.ts`. Never commit `.env` f
 2. **Intake** — `/onboard` form (Zod + Turnstile), `/api/onboard` → n8n WF-01 steps 1–3. Done when: double
    submit returns `duplicate: true`.
 3. **AI enrichment** — Haiku prompt + JSON schema in `n8n/prompts/`, validated output, `risk_level` stored.
-4. **Approval gate** — Wait node, Slack approval, WF-03, `/api/approve`, approval queue page.
-5. **Provisioning** — WF-02 step-level idempotency; Drive → ClickUp → Calendar → Gmail; WF-04 error handler.
-6. **Dashboard + polish** — Realtime views, stats, Simulate retry, Vitest + Playwright, README, demo video.
+4. **Approval gate** — WF-02 Approval Gate (route, decide, time out) + Slack alerts, `/api/approve`,
+   admin login, approval queue and run detail pages.
+5. **Provisioning** — WF-03 sub-workflow with step-level idempotency; Drive → ClickUp → Calendar → Gmail.
+6. **Dashboard + polish** — WF-04 error handler, Realtime views, stats, Simulate retry, Vitest + Playwright,
+   README, demo video.
 
 ## How to work in this repo
 

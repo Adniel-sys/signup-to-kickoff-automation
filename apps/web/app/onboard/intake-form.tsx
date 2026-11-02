@@ -10,35 +10,13 @@ import { Field, FieldDescription, FieldError, FieldGroup, FieldLabel, FieldLegen
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { submitIntake } from "@/lib/onboard-client";
 import {
-  intakeSchema,
-  type BUDGET_RANGES,
-  type Intake,
-  type IntakeInput,
-  type SERVICE_TIERS,
-  type TIMELINES,
-} from "@/lib/schemas/intake";
-
-const SERVICE_TIER_OPTIONS: Record<(typeof SERVICE_TIERS)[number], string> = {
-  starter: "Starter",
-  growth: "Growth",
-  enterprise: "Enterprise",
-};
-
-const BUDGET_OPTIONS: Record<(typeof BUDGET_RANGES)[number], string> = {
-  under_5k: "Under $5k",
-  "5k_15k": "$5k – $15k",
-  "15k_50k": "$15k – $50k",
-  "50k_plus": "$50k+",
-};
-
-const TIMELINE_OPTIONS: Record<(typeof TIMELINES)[number], string> = {
-  asap: "As soon as possible",
-  "1_3_months": "1–3 months",
-  "3_6_months": "3–6 months",
-  flexible: "Flexible",
-};
+  BUDGET_LABELS,
+  SERVICE_TIER_LABELS,
+  TIMELINE_LABELS,
+} from "@/lib/labels";
+import { submitIntake } from "@/lib/onboard-client";
+import { intakeSchema, type Intake, type IntakeInput } from "@/lib/schemas/intake";
 
 type IntakeControl = Control<IntakeInput, unknown, Intake>;
 
@@ -118,9 +96,9 @@ export function IntakeForm({ turnstileSiteKey }: { turnstileSiteKey: string }) {
           <FieldSet>
             <FieldLegend>Your project</FieldLegend>
             <FieldGroup className="grid gap-5 sm:grid-cols-3">
-              <SelectField control={form.control} name="service_tier" label="Service tier" options={SERVICE_TIER_OPTIONS} />
-              <SelectField control={form.control} name="budget_range" label="Budget" options={BUDGET_OPTIONS} />
-              <SelectField control={form.control} name="timeline" label="Timeline" options={TIMELINE_OPTIONS} />
+              <SelectField control={form.control} name="service_tier" label="Service tier" options={SERVICE_TIER_LABELS} />
+              <SelectField control={form.control} name="budget_range" label="Budget" options={BUDGET_LABELS} />
+              <SelectField control={form.control} name="timeline" label="Timeline" options={TIMELINE_LABELS} />
             </FieldGroup>
             <Controller
               control={form.control}

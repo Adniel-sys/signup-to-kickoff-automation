@@ -588,3 +588,659 @@ Clean up test rows (this cascades to the runs and steps):
 | `Validate output` fails with `$input is not defined` / `SyntaxError` | Code node isn't in "Run Once for All Items" JavaScript mode, or the paste was partial |
 | `Save enrichment` errors `invalid input syntax for type json` | A Query Parameters field is in Fixed mode, so the `{{ }}` text was sent literally |
 | Duplicate submit triggers Haiku | `Mark enriching` was connected after the duplicate reply instead of `New Run Created` |
+
+## Phase 4: approval gate (WF-01 hand-off + WF-02 Approval Gate)
+
+Low-risk runs are approved automatically. Every other run waits for a human in the website's
+`/admin` dashboard, with a Slack alert that links to it. If nobody decides within 48 hours, the run
+is rejected with the reason "approval timed out".
+
+**The database holds the state; workflows are short event handlers.** There is no Wait node
+anywhere: no n8n execution stays paused while a run waits. WF-01 is finished (Phases 2–3) and
+gets only one new node. All Phase 4 logic is in one new workflow, **WF-02 Approval Gate**, with
+three entry points:
+
+```
+WF-01  … Save Enrichment ─▶ Start approval (Execute Workflow → WF-02, don't wait)
+
+WF-02  Entry 1  When Executed by Another Workflow (run_id)
+                  ─▶ Load run ─▶ Needs approval? ─ false ─▶ Mark auto-approved                 ◀ Phase 5: Execute Workflow → WF-03
+                                                 └ true ──▶ Mark awaiting approval ─▶ Slack alert
+
+       Entry 2  Webhook POST /approval (from /api/approve)
+                  ─▶ Validate request ─▶ Valid? ─ true ─▶ Record decision ─▶ Recorded? ─ true ─▶ Reply: Recorded (200) ─▶ Slack decision alert   ◀ Phase 5: if approved, Execute Workflow → WF-03
+                                               │                                      └ false ─▶ Reply: Not awaiting (409)
+                                               └ false ─▶ Reply: Invalid (400)
+
+       Entry 3  Schedule, every 15 minutes
+                  ─▶ Reject timed-out runs ─▶ Slack timeout alert
+```
+
+| Workflow | Trigger | Status |
+|---|---|---|
+| WF-01 Intake & Enrichment | Webhook `/webhook/onboard` | Done (Phases 2–3) + `Start approval` |
+| WF-02 Approval Gate | The 3 triggers above | Phase 4 |
+| WF-03 Provisioning | Sub-workflow, called by WF-02 on approval | Phase 5 |
+| WF-04 Error Handler | Error Trigger | Phase 6 |
+
+**Auto-approve** only when `risk_level = 'low'` **and** `service_tier <> 'enterprise'`. Phase 3's
+business rule already makes enterprise runs high, so the tier check here is a second guard.
+
+Website files for this phase:
+
+| File | What it is |
+|---|---|
+| `apps/web/proxy.ts` | Refreshes the Supabase session; redirects signed-out `/admin` visits to `/login` |
+| `apps/web/lib/server/auth.ts` | Server-side session check used by every admin page and `/api/approve` |
+| `apps/web/app/login/` | Email + password sign-in |
+| `apps/web/app/admin/` | Approval queue, recent runs, run detail with Approve / Reject |
+| `apps/web/app/api/approve/route.ts` | Sends the decision to WF-02 entry 2 (contract: `docs/api-contract.md` §4–6) |
+
+No migration is needed. The decision goes in the `approval` step's `run_steps.output`, and a
+rejection reason in `onboarding_runs.error`. `onboarding_runs.resume_url` is **unused**: it stays
+`NULL`. The column is kept so the schema doesn't change.
+
+Same rules as before: read earlier data with `$('Node').first()`, never `.item`, and switch
+**every** field that contains `{{ }}` to **Expression** mode. Values go into SQL only through
+Query Parameters, never with `{{ }}` inside the query text.
+
+### 0. One-time setup
+
+**A. Supabase Auth** (Dashboard → Authentication):
+
+- **Sign In / Providers → Email:** enabled.
+- **Allow new users to sign up:** OFF. Every signed-in user is treated as an admin, so this must
+  stay off.
+- **Users:** your admin user exists and is confirmed (no "Waiting for verification" label).
+
+**B. Slack incoming webhook** (free workspace):
+
+1. Create a workspace at <https://slack.com/get-started> if you don't have one, and a channel
+   such as `#onboarding`.
+2. Go to <https://api.slack.com/apps> → **Create New App** → **From scratch**. Name it
+   `Northpeak Onboarding` and pick your workspace.
+3. **Incoming Webhooks** → switch **Activate Incoming Webhooks** ON → **Add New Webhook** → pick
+   `#onboarding` → **Allow**.
+4. Copy the webhook URL (`https://hooks.slack.com/services/T…/B…/…`).
+
+Treat the webhook URL as a secret: anyone who has it can post to your channel. It lives only in
+WF-02's `Slack alert`, `Slack decision alert` and `Slack timeout alert` nodes. **Scrub it from workflow exports**
+before committing them (replace it with `https://hooks.slack.com/services/REPLACE_ME`).
+
+**C. Dashboard base URL.** Slack messages link to `{DASHBOARD_URL}/admin/runs/{run_id}`. For now
+that's `http://localhost:3000`, typed into the Slack nodes' bodies. When the site is deployed
+in Phase 6, replace it there with the Vercel URL.
+
+### Part A: WF-01, one new node
+
+WF-01 is otherwise unchanged. Build WF-02 (Part B) first, so you can pick it here.
+
+#### A.1 `Start approval` (Execute Workflow): connect from `Save Enrichment`
+
+- **Source:** `Database` · **Workflow:** `From list` → `WF-02 Approval Gate`
+- **Workflow Inputs:** `run_id` = (Expression) `{{ $('Insert client + run').first().json.run_id }}`
+  (the field appears once WF-02's entry-1 trigger defines it, E1.1)
+- **Mode:** `Run once with all items`
+- **Options → Wait For Sub-Workflow Completion:** **OFF**. WF-01 hands the run over and ends; WF-02
+  runs as its own execution.
+
+`Save Enrichment` returns one row when it saved, and zero rows otherwise, so `Start approval` only
+runs after a successful enrichment. Save WF-01; it stays active.
+
+### Part B: WF-02 Approval Gate (new workflow)
+
+Create a new workflow named `WF-02 Approval Gate`. It holds three separate triggers on one
+canvas; each starts its own short execution. **Activate** it when all three entries are built:
+the webhook and the schedule only run while it is active.
+
+### Entry 1: route a new run
+
+#### E1.1 `When Executed by Another Workflow` (trigger)
+
+- **Input data mode:** `Define using fields below`
+- **Field:** name `run_id`, type `String`
+
+#### E1.2 `Load run` (Postgres)
+
+- **Credential:** `Supabase - Signup-to-Kickoff` · **Operation:** `Execute Query`
+- **Query:**
+
+```sql
+-- What routing needs, plus what the Slack alert shows. Zero rows unless the run is
+-- still 'enriching', so a repeated call does nothing.
+select r.id                          as run_id,
+       r.status,
+       c.company_name,
+       c.service_tier,
+       c.risk_level,
+       c.intake_ai ->> 'risk_reason' as risk_reason
+from public.onboarding_runs r
+join public.clients c on c.id = r.client_id
+where r.id = $1::uuid
+  and r.status = 'enriching';
+```
+
+- **Options → Query Parameters** (Expression): `{{ [ $json.run_id ] }}`
+- Leave **Always Output Data OFF**: zero rows ends entry 1.
+
+`risk_level` is the value Phase 3 saved, after its business rules.
+
+#### E1.3 `Needs approval?` (IF)
+
+- **Condition:** Boolean → `{{ $json.risk_level !== 'low' || $json.service_tier === 'enterprise' }}` → **is true**
+- `true` → E1.5 (manual), `false` → E1.4 (auto).
+
+A missing `risk_level` (`null`) counts as "not low", so it goes to a human.
+
+#### E1.4 `Mark auto-approved` (Postgres), on the false branch
+
+- **Credential:** `Supabase - Signup-to-Kickoff` · **Operation:** `Execute Query`
+- **Query:**
+
+```sql
+-- Auto path: approve the run and record the approval step, in one statement.
+-- Only from 'enriching', so a re-run can never approve twice.
+with run as (
+  update public.onboarding_runs
+     set status        = 'approved',
+         approval_mode = 'auto',
+         approved_by   = 'system',
+         approved_at   = now()
+   where id = $1::uuid
+     and status = 'enriching'
+  returning id
+)
+insert into public.run_steps (run_id, step_name, status, duration_ms, output)
+select id, 'approval', 'succeeded', 0, '{"mode": "auto"}'::jsonb
+from run
+on conflict (run_id, step_name) do update
+   set status      = 'succeeded',
+       duration_ms = 0,
+       output      = excluded.output,
+       error       = null
+returning run_id, status;
+```
+
+- **Options → Query Parameters** (Expression): `{{ [ $('Load run').first().json.run_id ] }}`
+- Leave **Always Output Data OFF**: zero rows means the run wasn't `enriching`, and nothing after
+  this node may run.
+
+> **Phase 5 attachment point.** Phase 5 connects `Mark auto-approved` → **Execute Workflow →
+> WF-03 Provisioning**. Add a sticky note on the canvas here so the spot is obvious. Nothing is
+> connected after it in Phase 4.
+
+#### E1.5 `Mark awaiting approval` (Postgres), on the true branch
+
+- **Credential:** `Supabase - Signup-to-Kickoff` · **Operation:** `Execute Query`
+- **Query:**
+
+```sql
+-- Manual path: park the run and open its approval step. Only from 'enriching'.
+-- It also returns what the Slack alert shows. resume_url is not used and stays NULL.
+with run as (
+  update public.onboarding_runs
+     set status        = 'awaiting_approval',
+         approval_mode = 'manual'
+   where id = $1::uuid
+     and status = 'enriching'
+  returning id, client_id
+),
+step as (
+  insert into public.run_steps (run_id, step_name, status)
+  select id, 'approval', 'started'
+  from run
+  on conflict (run_id, step_name) do update
+     set status      = 'started',
+         attempt     = public.run_steps.attempt + 1,
+         error       = null,
+         output      = null,
+         duration_ms = null,
+         created_at  = now()
+  returning run_id, created_at
+)
+select step.run_id,
+       step.created_at                 as waiting_since,
+       c.company_name,
+       c.service_tier,
+       c.risk_level,
+       c.intake_ai ->> 'risk_reason'   as risk_reason
+from step
+join run on run.id = step.run_id
+join public.clients c on c.id = run.client_id;
+```
+
+- **Options → Query Parameters** (Expression): `{{ [ $('Load run').first().json.run_id ] }}`
+- Leave **Always Output Data OFF**: zero rows stops the branch before Slack.
+
+The `approval` step's `created_at` is when the run started waiting. Entry 3's 48-hour clock and the
+dashboard's "waiting for" both read it.
+
+#### E1.6 `Slack alert` (HTTP Request)
+
+- **Method:** `POST` · **URL:** your Slack webhook URL (Fixed mode) · **Authentication:** `None`
+- **Send Body:** ON → **Body Content Type:** `JSON` → **Specify Body:** `Using JSON`
+- **JSON** (Expression mode):
+
+```
+{{ JSON.stringify({
+  text: "*Approval needed:* " + $json.company_name.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    + "\nTier: " + $json.service_tier + " · Risk: " + ($json.risk_level ?? "not assessed")
+    + "\n> " + ($json.risk_reason ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    + "\n<http://localhost:3000/admin/runs/" + $json.run_id + "|Review in the dashboard>"
+}) }}
+```
+
+  `$json` is `Mark awaiting approval`'s row. The company name and risk reason come from the
+  client's intake, so `&`, `<` and `>` are escaped. Without that, an intake could post Slack
+  links or `<!channel>` mentions. `http://localhost:3000` is the dashboard base URL from 0C.
+
+- **Options → Timeout:** `10000`
+- **Settings tab:** **On Error:** `Continue` (the plain option). A failed Slack post must never
+  block the approval: the run is already `awaiting_approval` and in the dashboard queue.
+
+Entry 1 ends here.
+
+### Entry 2: record a decision
+
+The website calls this from `/api/approve` after checking the admin's session; the contract is
+`docs/api-contract.md` §5.
+
+#### E2.1 `Webhook`
+
+- **HTTP Method:** `POST`
+- **Path:** `approval`
+- **Authentication:** `Header Auth` → credential `Onboard Webhook Secret` (the same one WF-01 uses)
+- **Respond:** `Using 'Respond to Webhook' Node`
+
+Body: `{ run_id, decision: 'approve' | 'reject', decided_by, note }`. The production URL is
+`{N8N_BASE_URL}/webhook/approval`; it only works while WF-02 is **active**.
+
+#### E2.2 `Validate request` (Code)
+
+- **Mode:** `Run Once for All Items` · **Language:** `JavaScript`
+- **Code:** paste the whole of `n8n/snippets/validate-approval.js`.
+
+It outputs `{ valid: true, run_id, decision, decided_by, note }` (note trimmed, blank → `null`) or
+`{ valid: false, errors: [...] }`. The rules match the website's (`run_id` is a uuid, `decision` is
+approve/reject, a rejection has a note of at least 3 characters, note ≤ 500). This is defense in
+depth: the website validates first.
+
+#### E2.3 `Valid?` (IF)
+
+- **Condition:** Boolean → `{{ $json.valid }}` → **is true**
+- `true` → E2.5, `false` → E2.4.
+
+#### E2.4 `Reply: Invalid (400)` (Respond to Webhook), on the false branch
+
+- **Respond With:** `JSON`
+- **Response Body** (Expression): `{{ { ok: false, error: 'invalid_request', errors: $json.errors } }}`
+- **Options → Response Code:** `400`
+
+#### E2.5 `Record decision` (Postgres), on the true branch
+
+- **Credential:** `Supabase - Signup-to-Kickoff` · **Operation:** `Execute Query`
+- **Query:**
+
+```sql
+-- One atomic statement: record an approve or reject, but only while the run is still
+-- awaiting approval. Returns the run's new status and company name (for the Slack decision
+-- alert), or zero rows if it wasn't waiting (already decided, timed out, or unknown).
+-- Two racing requests can't both win.
+with run as (
+  update public.onboarding_runs
+     set status      = case $2::text when 'approve' then 'approved' else 'rejected' end,
+         approved_by = case $2::text when 'approve' then $3::text end,
+         approved_at = case $2::text when 'approve' then now() end,
+         finished_at = case $2::text when 'reject' then now() end,
+         error       = case $2::text when 'reject' then $4::text end
+   where id = $1::uuid
+     and status = 'awaiting_approval'
+     and $2::text in ('approve', 'reject')
+  returning id, status, client_id
+),
+step as (
+  insert into public.run_steps (run_id, step_name, status, duration_ms, output)
+  select id, 'approval', 'succeeded', 0,
+         jsonb_build_object('mode', 'manual', 'decision', $2::text,
+                            'decided_by', $3::text, 'note', $4::text)
+  from run
+  on conflict (run_id, step_name) do update
+     set status      = 'succeeded',
+         duration_ms = (extract(epoch from (now() - public.run_steps.created_at)) * 1000)::int,
+         output      = excluded.output,
+         error       = null
+  returning run_id
+)
+select run.id as run_id, run.status, c.company_name
+from run
+join step on step.run_id = run.id
+join public.clients c on c.id = run.client_id;
+```
+
+- **Options → Query Parameters** (Expression):
+
+```
+{{ [
+  $('Validate request').first().json.run_id,
+  $('Validate request').first().json.decision,
+  $('Validate request').first().json.decided_by,
+  $('Validate request').first().json.note
+] }}
+```
+
+- **Settings tab → Always Output Data: ON.** Zero rows must still reach `Recorded?` so the caller
+  gets a `409`, not a timeout.
+
+For a rejection, the note becomes the run's `error` (the reason the dashboard shows). The
+`decided_by` of a rejection is kept in the step's output; `approved_by` stays empty. The approval
+step ends `succeeded` either way, because a decision was made; the run's status carries the outcome.
+
+#### E2.6 `Recorded?` (IF)
+
+- **Condition:** String → `{{ $json.status ?? '' }}` → **is not empty**
+- `true` → E2.7, `false` → E2.9.
+
+On zero rows, "Always Output Data" emits one empty item, so `status` is empty. The `?? ''` keeps
+n8n's strict type check from failing on `undefined`.
+
+#### E2.7 `Reply: Recorded (200)` (Respond to Webhook)
+
+- **Respond With:** `JSON`
+- **Response Body** (Expression): `{{ { ok: true, run_id: $json.run_id, status: $json.status } }}`
+- **Options → Response Code:** `200`
+
+#### E2.8 `Slack decision alert` (HTTP Request): connect from `Reply: Recorded (200)`
+
+Tells the channel the decision was made, so nobody else opens the "Review" link for a run that's
+already done.
+
+- **Method:** `POST` · **URL:** your Slack webhook URL (Fixed mode) · **Authentication:** `None`
+- **Send Body:** ON → **Body Content Type:** `JSON` → **Specify Body:** `Using JSON`
+- **JSON** (Expression mode):
+
+```
+{{ (() => {
+  const esc = s => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const d = $('Record decision').first().json;
+  const v = $('Validate request').first().json;
+  const approved = d.status === 'approved';
+  return JSON.stringify({
+    text: (approved ? "✅ *Approved:* " : "❌ *Rejected:* ") + esc(d.company_name)
+      + " · by " + esc(v.decided_by)
+      + (v.note ? "\n> " + esc(v.note) : "")
+      + "\n<http://localhost:3000/admin/runs/" + d.run_id + "|View in the dashboard>"
+  });
+})() }}
+```
+
+  It reads `Record decision` and `Validate request` by name, not `$json`, because a Respond to
+  Webhook node's output isn't guaranteed to be its input. The company name, `decided_by` and the
+  note are escaped like the other Slack nodes (`esc`). The note line is left out when there is
+  no note (an approval without one); only a note's first line is shown as a quote.
+
+- **Options → Timeout:** `10000`
+- **Settings tab:** **On Error:** `Continue`. The decision is already saved and the website already
+  has its `200`; a failed Slack post must not mark the execution as failed.
+
+> **Phase 5 attachment point.** Phase 5 connects `Slack decision alert` → an IF on
+> `{{ $('Record decision').first().json.status }}` equals `approved` → **Execute Workflow → WF-03
+> Provisioning**. It sits **after** the reply so the website gets its answer at once, and after the
+> Slack post, which passes an item on even when it fails (On Error: Continue). Add a sticky note
+> here. Nothing is connected after it in Phase 4.
+
+#### E2.9 `Reply: Not awaiting (409)` (Respond to Webhook)
+
+- **Respond With:** `JSON`
+- **Response Body:** `{"ok": false, "error": "not_awaiting_approval"}`
+- **Options → Response Code:** `409`
+
+#### Entry 2 by hand
+
+The website is the normal caller, but you can check WF-02 directly (PowerShell 7, from the repo
+root; it reads the secret from `apps/web/.env.local` without printing it). Use the id of a run
+that is `awaiting_approval`:
+
+```powershell
+$vars = @{}
+Get-Content apps/web/.env.local | Where-Object { $_ -match '^\s*(ONBOARD_WEBHOOK_SECRET|N8N_BASE_URL)\s*=' } |
+  ForEach-Object { $k, $v = $_ -split '=', 2; $vars[$k.Trim()] = $v.Trim().Trim('"') }
+$body = @{ run_id = "<run id>"; decision = "approve"; decided_by = "you@example.com"; note = $null } | ConvertTo-Json
+Invoke-WebRequest -Method Post -Uri "$($vars.N8N_BASE_URL)/webhook/approval" -ContentType "application/json" -Body $body `
+  -Headers @{ "X-Onboard-Secret" = $vars.ONBOARD_WEBHOOK_SECRET; "ngrok-skip-browser-warning" = "true" } -SkipHttpErrorCheck |
+  Select-Object StatusCode, Content
+```
+
+The first call returns `200 {"ok":true,…,"status":"approved"}`; the same call again returns `409`.
+
+### Entry 3: time out waiting runs
+
+#### E3.1 `Schedule Trigger`
+
+- **Trigger Interval:** `Minutes` · **Minutes Between Triggers:** `15`
+
+A run can sit up to 15 minutes past its 48 hours before it's rejected. That's fine for a
+48-hour window.
+
+#### E3.2 `Reject timed-out runs` (Postgres)
+
+- **Credential:** `Supabase - Signup-to-Kickoff` · **Operation:** `Execute Query`
+- **Query:**
+
+```sql
+-- Reject every run still awaiting approval whose approval step opened more than $1 ago.
+-- Guarded on the run's status, so a decision recorded at the same moment wins cleanly
+-- and is never overwritten. Returns one row per rejected run.
+with run as (
+  update public.onboarding_runs r
+     set status      = 'rejected',
+         finished_at = now(),
+         error       = 'approval timed out'
+    from public.run_steps s
+   where s.run_id = r.id
+     and s.step_name = 'approval'
+     and s.status = 'started'
+     and s.created_at < now() - $1::interval
+     and r.status = 'awaiting_approval'
+  returning r.id, r.client_id
+),
+step as (
+  update public.run_steps s
+     set status      = 'succeeded',
+         duration_ms = (extract(epoch from (now() - s.created_at)) * 1000)::int,
+         output      = '{"mode": "timeout", "decision": "reject"}'::jsonb
+    from run
+   where s.run_id = run.id
+     and s.step_name = 'approval'
+  returning s.run_id
+)
+select run.id as run_id, c.company_name
+from run
+join step on step.run_id = run.id
+join public.clients c on c.id = run.client_id
+order by c.company_name;
+```
+
+- **Options → Query Parameters** (Expression): `{{ [ '48 hours' ] }}` (type it without the
+  surrounding backticks; n8n ignores text outside `{{ }}` here, but the field should hold only the expression)
+- Leave **Always Output Data OFF**. When nothing timed out, the query returns zero rows and the
+  workflow stops here, so Slack is only called when there is something to report.
+
+#### E3.3 `Slack timeout alert` (HTTP Request)
+
+- **Method:** `POST` · **URL:** your Slack webhook URL (Fixed mode) · **Authentication:** `None`
+- **Send Body:** ON → **Body Content Type:** `JSON` → **Specify Body:** `Using JSON`
+- **JSON** (Expression mode):
+
+```
+{{ JSON.stringify({
+  text: "*Approval timed out:* no decision within 48 hours, so these runs were rejected:\n"
+    + $input.all().map(i => "• <http://localhost:3000/admin/runs/" + i.json.run_id + "|"
+        + i.json.company_name.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\|/g, "/")
+        + ">").join("\n")
+}) }}
+```
+
+- **Options → Timeout:** `10000`
+- **Settings tab:** **Execute Once:** ON (one message listing every run, not one per run) ·
+  **On Error:** `Continue`. The runs are already rejected; a Slack failure changes nothing.
+
+#### Testing the timeout
+
+1. In `Reject timed-out runs`, set Query Parameters to `{{ [ '2 minutes' ] }}`.
+2. In `Schedule Trigger`, set **Minutes Between Triggers** to `1`. Save.
+3. Submit a medium-risk intake and don't decide. After 3–4 minutes the run is `rejected`.
+4. **Restore** `'48 hours'` and `15`, and save. Leaving the test values in would reject real runs
+   after 2 minutes.
+
+### Test
+
+Start the website (`npm run dev`) and sign in at <http://localhost:3000/login>. Then:
+
+| # | Test | Steps | Expected |
+|---|---|---|---|
+| 1 | Signed out is blocked | In a private window open `/admin` and `/admin/runs/<any id>`. Then send a POST to `/api/approve` with no cookie (below) | Both pages redirect to `/login?next=…`; signing in lands back on the page. The POST returns `401` |
+| 2 | Low risk: auto-approve | Submit a clear growth-tier intake (e.g. Bloom & Basil Florist) | Run `approved`, `approval_mode = auto`, `approved_by = system`; step `approval` succeeded with `{"mode": "auto"}`; no Slack message; not in the queue. WF-01's execution has finished |
+| 3 | Medium: manual approve | Submit Summit Physical Therapy | WF-01 and WF-02's executions both **finish** (nothing paused). A Slack alert with a working "Review" link; the run is in the queue; **Approve** → `approved`, `approved_by` = your email; one WF-02 entry-2 execution; a "✅ Approved" message in Slack |
+| 4 | High: manual reject with note | Submit Vertex Commerce Group. Try **Reject** with an empty note first | An empty note is refused in the form. With a note → `rejected`, `error` = your note, `finished_at` set; the page shows "Rejected: <note>"; a "❌ Rejected" message in Slack with the note |
+| 5 | Timeout reject | Use the 2-minute test settings (entry 3), submit a medium intake, don't decide | After 3–4 min: `rejected`, `error = approval timed out`, step output `{"mode": "timeout", "decision": "reject"}`, a Slack timeout message. Restore the settings |
+| 6 | Double-click approve | Open one waiting run in two tabs. Approve in the first, then approve in the second | The first succeeds; the second shows "no longer waiting" (`409`) and refreshes to `Approved` |
+
+POST without a session (PowerShell 7):
+
+```powershell
+Invoke-WebRequest -Method Post -Uri http://localhost:3000/api/approve -ContentType "application/json" `
+  -Body '{"run_id":"00000000-0000-4000-8000-000000000000","decision":"approve"}' -SkipHttpErrorCheck |
+  Select-Object StatusCode, Content
+```
+
+To see WF-02's own `409` (not just the website's pre-check), run "Entry 2 by hand" twice on the
+same run.
+
+Check the runs in the Supabase SQL editor:
+
+```sql
+select c.company_name,
+       c.service_tier,
+       c.risk_level,
+       r.status,
+       r.approval_mode,
+       r.approved_by,
+       r.error,
+       s.status                      as approval_step,
+       s.created_at                  as waiting_since,
+       s.output                      as approval_output
+from public.clients c
+join public.onboarding_runs r on r.client_id = c.id
+left join public.run_steps s on s.run_id = r.id and s.step_name = 'approval'
+order by r.started_at desc
+limit 6;
+```
+
+In n8n → **Executions**, no execution should be in the "Waiting" state.
+
+### Test results
+
+| Test | Result |
+|---|---|
+| 1 Signed out is blocked | ✅ |
+| 2 Low risk: auto-approve | ✅ |
+| 3 Medium: manual approve | ✅ |
+| 4 Reject without a note is blocked | ✅ |
+| 4 Reject with a note | ✅ |
+| 3–4 Decision alert in Slack (`Slack decision alert`) | ✅ |
+| 6 Stale tab: second approve → `409` | [fill in result] |
+| 5 Timeout reject | [fill in result] |
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| `/admin` sends you back to `/login` right after signing in | Session cookie not stored: open the site on `http://localhost:3000` exactly, not `127.0.0.1` or another port |
+| "Invalid email or password" with the right password | The user isn't confirmed, or the Email provider is disabled (0A) |
+| Dashboard shows "No runs yet" but runs exist | The RLS policies and revokes from the Phase 1 migration were never applied to the live database. Run the SQL in [Fix: RLS policies and revokes](#fix-rls-policies-and-revokes), then [check the live database](#check-the-live-database-against-the-migration) |
+| Slack's "Review" link asks you to sign in | Expected in a browser without a dashboard session. After signing in, `/login?next=…` sends you back to the run |
+| 404 `The requested webhook "POST approval" is not registered` while WF-02 shows **Published** | The Webhook node's **Path** is still n8n's random default (a UUID). Set it to exactly `approval`, save, and publish again |
+| An edit in n8n doesn't take effect | The live (published) version is a snapshot taken when you published. **Publish again after every change** |
+| "Referenced node doesn't exist" or an expression returns nothing | Node names are case-sensitive: `Load run`, `Validate request`, `Record decision` exactly, as written in this runbook |
+| Approve shows "couldn't be delivered" (502); server log `n8n error HTTP 404 … not registered` | WF-02 isn't active, or its Webhook path isn't exactly `approval` (see the row above) |
+| 502; server log `n8n error HTTP 403` or `401` | WF-02's Webhook Authentication isn't the `Onboard Webhook Secret` Header Auth credential |
+| 502; server log `n8n error HTTP 200: …` with some other body | A reply node's body is in Fixed mode, or `Reply: Recorded (200)` doesn't echo `run_id` and `status` |
+| A decided run gets 502 or 503 from WF-02 instead of 409 | `Record decision` has Always Output Data OFF, so on zero rows no reply node runs. Turn it ON (E2.5) |
+| 400 "refused this decision as invalid"; server log shows WF-02's `errors` | The website and `Validate request` disagree; re-paste `n8n/snippets/validate-approval.js` |
+| 409 on the very first click | The run isn't `awaiting_approval`: entry 3 timed it out, someone else decided, or `Mark awaiting approval` never ran (check WF-02's entry-1 execution) |
+| Run stays `awaiting_approval` after 48 hours | WF-02 isn't active (the Schedule only fires when it is), or the Query Parameters field of `Reject timed-out runs` is in Fixed mode |
+| Runs are rejected after a few minutes | Entry 3 still has the test settings (`'2 minutes'`, every 1 minute). Restore them |
+| Slack alert never arrives, but the run waits in the queue | Expected when Slack fails; check `Slack alert`'s output. The webhook URL may have been revoked |
+| Slack says `invalid_payload`, or shows literal `{{ … }}` | The JSON body is in Fixed mode; switch it to Expression |
+| One Slack timeout message per run instead of one list | **Execute Once** is off on `Slack timeout alert` |
+| Run stays `enriching` after enrichment; no WF-02 execution | `Start approval` isn't connected after `Save Enrichment`, points at the wrong workflow, or `Save Enrichment` returned zero rows |
+| `Start approval` fails with "…is not allowed to call…" | WF-02 → **Settings → This workflow can be called by**: allow WF-01 (workflows from the same owner is the default) |
+| WF-02 entry 1 runs with `run_id` empty | The trigger's input field isn't named exactly `run_id`, or `Start approval`'s value is in Fixed mode |
+| `Load run` returns nothing | The run isn't `enriching` (already routed, or enrichment failed), so entry 1 correctly stops |
+| Low-risk run goes to the manual path | `risk_level` isn't `low` in `clients` (check the row), or the tier is `enterprise` (Phase 3's rule makes it high anyway) |
+
+### Fix: RLS policies and revokes
+
+If the Phase 1 migration's security part never reached the live database, run this once in the
+Supabase SQL editor. It is the same SQL as `supabase/migrations/20261027000000_init_schema.sql`,
+written so it can run again safely.
+
+```sql
+alter table public.clients         enable row level security;
+alter table public.onboarding_runs enable row level security;
+alter table public.run_steps       enable row level security;
+
+drop policy if exists "authenticated can read clients" on public.clients;
+create policy "authenticated can read clients"
+  on public.clients for select to authenticated using (true);
+
+drop policy if exists "authenticated can read onboarding_runs" on public.onboarding_runs;
+create policy "authenticated can read onboarding_runs"
+  on public.onboarding_runs for select to authenticated using (true);
+
+drop policy if exists "authenticated can read run_steps" on public.run_steps;
+create policy "authenticated can read run_steps"
+  on public.run_steps for select to authenticated using (true);
+
+revoke all on public.clients, public.onboarding_runs, public.run_steps from anon;
+revoke insert, update, delete, truncate, references, trigger
+  on public.clients, public.onboarding_runs, public.run_steps from authenticated;
+```
+
+### Check the live database against the migration
+
+Run this in the Supabase SQL editor. It returns one row per thing the migration creates; any row
+with `ok = false` is missing from the live database (sorted to the top).
+
+```sql
+select item, ok
+from (values
+  ('RLS on clients',                         (select relrowsecurity from pg_class where oid = 'public.clients'::regclass)),
+  ('RLS on onboarding_runs',                 (select relrowsecurity from pg_class where oid = 'public.onboarding_runs'::regclass)),
+  ('RLS on run_steps',                       (select relrowsecurity from pg_class where oid = 'public.run_steps'::regclass)),
+  ('policy: authenticated reads clients',         exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'clients'         and cmd = 'SELECT' and 'authenticated' = any (roles))),
+  ('policy: authenticated reads onboarding_runs', exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'onboarding_runs' and cmd = 'SELECT' and 'authenticated' = any (roles))),
+  ('policy: authenticated reads run_steps',       exists (select 1 from pg_policies where schemaname = 'public' and tablename = 'run_steps'       and cmd = 'SELECT' and 'authenticated' = any (roles))),
+  ('anon has no table privileges', not exists (
+     select 1 from unnest(array['public.clients', 'public.onboarding_runs', 'public.run_steps']) t,
+                   unnest(array['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']) p
+     where has_table_privilege('anon', t, p))),
+  ('authenticated can select', (
+     select bool_and(has_table_privilege('authenticated', t, 'SELECT'))
+     from unnest(array['public.clients', 'public.onboarding_runs', 'public.run_steps']) t)),
+  ('authenticated has no write privileges', not exists (
+     select 1 from unnest(array['public.clients', 'public.onboarding_runs', 'public.run_steps']) t,
+                   unnest(array['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']) p
+     where has_table_privilege('authenticated', t, p))),
+  ('index onboarding_runs_status_idx',    to_regclass('public.onboarding_runs_status_idx') is not null),
+  ('index onboarding_runs_client_id_idx', to_regclass('public.onboarding_runs_client_id_idx') is not null),
+  ('index run_steps_run_id_idx',          to_regclass('public.run_steps_run_id_idx') is not null),
+  ('unique clients(submission_id)',       exists (select 1 from pg_constraint where conrelid = 'public.clients'::regclass and contype = 'u')),
+  ('unique run_steps(run_id, step_name)', exists (select 1 from pg_constraint where conrelid = 'public.run_steps'::regclass and contype = 'u')),
+  ('check onboarding_runs.status',        exists (select 1 from pg_constraint where conrelid = 'public.onboarding_runs'::regclass and contype = 'c' and pg_get_constraintdef(oid) like '%awaiting_approval%')),
+  ('check run_steps.status',              exists (select 1 from pg_constraint where conrelid = 'public.run_steps'::regclass and contype = 'c' and pg_get_constraintdef(oid) like '%skipped%')),
+  ('realtime: onboarding_runs', exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'onboarding_runs')),
+  ('realtime: run_steps',       exists (select 1 from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'run_steps'))
+) as expected (item, ok)
+order by ok, item;
+```
