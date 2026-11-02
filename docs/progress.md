@@ -29,8 +29,8 @@ Approve/Reject. Slack alerts for approval needed, decisions, and timeouts.
 ## Test results so far
 
 **Phase 2** (runbook, WF-01 "Verify"): first submit → `202`, `duplicate: false`; second submit with
-the same `submission_id` → `200`, `duplicate: true`, same `run_id`. Passed (the Phase 2 done
-criterion); results weren't recorded in a table.
+the same `submission_id` → `200`, `duplicate: true`, same `run_id`. **Passed**, verified manually
+on 2026-10-29: a console replay returned `duplicate: true` with the same `run_id`.
 
 **Phase 3 fix re-test** (runbook, "Phase 3 fix re-test"): 7/7 pass.
 
