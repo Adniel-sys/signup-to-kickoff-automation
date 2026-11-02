@@ -10,6 +10,8 @@ It is a demo built to behave like production. Prioritize correctness, idempotenc
 
 **Phase 4 complete; next is Phase 5 (WF-03 Provisioning).** Do not start a phase unless told.
 
+Progress, test results and open items: [docs/progress.md](docs/progress.md).
+
 n8n workflows are built manually in the n8n UI, not generated as code. Exported JSON in `n8n/workflows/`
 is a reference copy (credentials stripped).
 
